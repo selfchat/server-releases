@@ -1,0 +1,181 @@
+name: Server release
+
+# The public download of selfchat-server (selfchat/server is private).
+#
+# selfchat/server's release workflow pushes a server-vX.Y.Z tag here for
+# each of its vX.Y.Z tags. That push starts this workflow, which builds
+# that version from source and publishes:
+#
+# - a server-vX.Y.Z release with static Linux binaries (x86-64 and ARM64),
+#   the installer and the deploy files, with the setup guide
+#   (docs/setup.md) as its notes;
+# - the multi-arch Docker image ghcr.io/selfchat/server:vX.Y.Z, and
+#   :latest for the newest version.
+#
+# This repository is public, so its runners are free, and the image,
+# linked here by its source label, is public too.
+#
+# To publish an existing version by hand: run this workflow with the tag,
+# e.g. server-v0.15.0.
+
+on:
+  push:
+    tags: ["server-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish, e.g. server-v0.15.0"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Which version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      ref: ${{ steps.v.outputs.ref }}
+    steps:
+      - id: v
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^server-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Expected a tag like server-v0.15.0, got $TAG"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # server-v0.15.0 here is v0.15.0 in selfchat/server.
+          echo "ref=refs/tags/${TAG#server-}" >> "$GITHUB_OUTPUT"
+
+  # Static Linux binaries: musl, so they run on any distro, a Raspberry Pi
+  # or a NAS, whatever its C library.
+  binaries:
+    name: Linux ${{ matrix.arch }} binary
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: selfchat/server
+          ref: ${{ needs.version.outputs.ref }}
+          ssh-key: ${{ secrets.SERVER_DEPLOY_KEY }}
+          path: server
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.arch }}-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release -p selfchat-server --locked --target ${{ matrix.arch }}-unknown-linux-musl
+        working-directory: server
+      - name: Name and checksum it
+        run: |
+          mkdir out
+          cp server/target/${{ matrix.arch }}-unknown-linux-musl/release/selfchat-server out/selfchat-server-${{ matrix.arch }}-linux
+          cd out && sha256sum selfchat-server-${{ matrix.arch }}-linux > selfchat-server-${{ matrix.arch }}-linux.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: selfchat-server-${{ matrix.arch }}-linux
+          path: out/*
+
+  publish:
+    name: Publish
+    needs: [version, binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: selfchat/server
+          ref: ${{ needs.version.outputs.ref }}
+          ssh-key: ${{ secrets.SERVER_DEPLOY_KEY }}
+          path: server
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: out
+          merge-multiple: true
+      - name: Gather the installer and deploy files
+        run: |
+          cp server/deploy/install.sh server/deploy/selfchat.service server/deploy/docker-compose.yml out/
+          (cd out && sha256sum install.sh > install.sh.sha256)
+          ls -l out
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/* -R "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" out/* -R "$GITHUB_REPOSITORY" \
+              --title "selfchat-server ${TAG#server-v}" \
+              --notes-file server/docs/setup.md
+          fi
+
+  # Multi-arch image from the same binaries.
+  docker:
+    name: Docker image
+    # After the release, so its tag exists here for the :latest check.
+    needs: [version, binaries, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: selfchat/server
+          ref: ${{ needs.version.outputs.ref }}
+          ssh-key: ${{ secrets.SERVER_DEPLOY_KEY }}
+          path: server
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: server/deploy/bin
+          merge-multiple: true
+      - name: Image tags
+        id: tags
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          version="v${TAG#server-v}"
+          tags="ghcr.io/selfchat/server:$version"
+          # :latest only for the newest server-v* tag, so publishing an
+          # older version again doesn't move it back.
+          newest=$(git ls-remote --tags --refs "https://github.com/$GITHUB_REPOSITORY" 'server-v*' \
+            | sed 's|.*refs/tags/||' | sort -V | tail -n 1)
+          if [ "$newest" = "$TAG" ]; then
+            tags="$tags,ghcr.io/selfchat/server:latest"
+          fi
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "Publishing $tags"
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: server/deploy
+          file: server/deploy/Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          # Links the package to this public repository.
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=selfchat mailbox server
