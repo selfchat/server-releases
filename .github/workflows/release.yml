@@ -110,6 +110,26 @@ jobs:
           cp server/deploy/install.sh server/deploy/selfchat.service server/deploy/docker-compose.yml out/
           (cd out && sha256sum install.sh > install.sh.sha256)
           ls -l out
+      # Every file gets an Ed25519 signature (name.sig). install.sh has the
+      # public key built in and checks the binary and the service file
+      # before installing them. The private key is only in this secret,
+      # and only here, for the moment it takes to sign.
+      - name: Sign
+        env:
+          SIGNING_KEY: ${{ secrets.SERVER_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/signing.pem"
+          trap 'rm -f "$key"' EXIT
+          umask 077
+          printf '%s\n' "$SIGNING_KEY" > "$key"
+          openssl pkey -in "$key" -pubout -out "$RUNNER_TEMP/signing.pub"
+          for f in out/*; do
+            openssl pkeyutl -sign -inkey "$key" -rawin -in "$f" -out "$f.sig"
+            openssl pkeyutl -verify -pubin -inkey "$RUNNER_TEMP/signing.pub" -rawin -in "$f" -sigfile "$f.sig" >/dev/null
+          done
+          # The installer must carry this same key, or nothing would install.
+          grep -q "$(sed -n 2p "$RUNNER_TEMP/signing.pub")" out/install.sh
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
