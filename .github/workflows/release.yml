@@ -65,12 +65,16 @@ jobs:
           - arch: aarch64
             runner: ubuntu-24.04-arm
     env:
-      # selfchat-proto comes from the private selfchat/proto over SSH: cargo
-      # uses git, with https rewritten to SSH for this job only.
+      # selfchat-proto (selfchat/proto) and selfchat-gifs (selfchat/gif-relay)
+      # come over SSH: cargo uses git, with https rewritten to SSH for this
+      # job only, through one host name per repository so each uses its own
+      # deploy key.
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-      GIT_CONFIG_COUNT: "1"
-      GIT_CONFIG_KEY_0: url.git@github.com:selfchat/proto.insteadOf
+      GIT_CONFIG_COUNT: "2"
+      GIT_CONFIG_KEY_0: url.git@github-proto:selfchat/proto.insteadOf
       GIT_CONFIG_VALUE_0: https://github.com/selfchat/proto
+      GIT_CONFIG_KEY_1: url.git@github-gif-relay:selfchat/gif-relay.insteadOf
+      GIT_CONFIG_VALUE_1: https://github.com/selfchat/gif-relay
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -78,24 +82,30 @@ jobs:
           ref: ${{ needs.version.outputs.ref }}
           ssh-key: ${{ secrets.SERVER_DEPLOY_KEY }}
           path: server
-      # Read access to selfchat/proto: the deploy key and GitHub's host key
-      # go in this job's temp folder, used through GIT_SSH_COMMAND. Nothing
-      # goes in ~/.ssh or the global git config, which would stay on a
-      # self-hosted machine for the next job (and another repository's).
-      - name: Read access to selfchat/proto
+      # Read access to the private selfchat/proto and selfchat/gif-relay: the
+      # deploy keys, GitHub's host key and an SSH config naming one host per
+      # repository go in this job's temp folder, used through
+      # GIT_SSH_COMMAND. Nothing goes in ~/.ssh or the global git config.
+      - name: Read access to selfchat/proto and selfchat/gif-relay
         shell: bash
         env:
-          KEY: ${{ secrets.PROTO_DEPLOY_KEY }}
+          PROTO_KEY: ${{ secrets.PROTO_DEPLOY_KEY }}
+          GIF_RELAY_KEY: ${{ secrets.GIF_RELAY_DEPLOY_KEY }}
         run: |
           umask 077
           tmp="$RUNNER_TEMP"
           command -v cygpath >/dev/null && tmp="$(cygpath -m "$RUNNER_TEMP")"
-          dir="$tmp/proto-ssh"
+          dir="$tmp/repos-ssh"
           mkdir -p "$dir"
-          printf '%s\n' "$KEY" > "$dir/key"
+          printf '%s\n' "$PROTO_KEY" > "$dir/proto"
+          printf '%s\n' "$GIF_RELAY_KEY" > "$dir/gif-relay"
           # GitHub's published SSH host key.
           echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$dir/known_hosts"
-          echo "GIT_SSH_COMMAND=ssh -i $dir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$dir/known_hosts -o StrictHostKeyChecking=yes" >> "$GITHUB_ENV"
+          : > "$dir/config"
+          for repo in proto gif-relay; do
+            printf 'Host github-%s\n  HostName github.com\n  User git\n  IdentityFile %s/%s\n  IdentitiesOnly yes\n  UserKnownHostsFile %s/known_hosts\n  HostKeyAlias github.com\n  StrictHostKeyChecking yes\n' "$repo" "$dir" "$repo" "$dir" >> "$dir/config"
+          done
+          echo "GIT_SSH_COMMAND=ssh -F $dir/config" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: stable
