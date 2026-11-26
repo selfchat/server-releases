@@ -97,23 +97,13 @@ jobs:
           command -v cygpath >/dev/null && tmp="$(cygpath -m "$RUNNER_TEMP")"
           dir="$tmp/repos-ssh"
           mkdir -p "$dir"
-          printf '%s
-' "$PROTO_KEY" > "$dir/proto"
-          printf '%s
-' "$GIF_RELAY_KEY" > "$dir/gif-relay"
+          printf '%s\n' "$PROTO_KEY" > "$dir/proto"
+          printf '%s\n' "$GIF_RELAY_KEY" > "$dir/gif-relay"
           # GitHub's published SSH host key.
           echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$dir/known_hosts"
           : > "$dir/config"
           for repo in proto gif-relay; do
-            printf 'Host github-%s
-  HostName github.com
-  User git
-  IdentityFile %s/%s
-  IdentitiesOnly yes
-  UserKnownHostsFile %s/known_hosts
-  HostKeyAlias github.com
-  StrictHostKeyChecking yes
-' "$repo" "$dir" "$repo" "$dir" >> "$dir/config"
+            printf 'Host github-%s\n  HostName github.com\n  User git\n  IdentityFile %s/%s\n  IdentitiesOnly yes\n  UserKnownHostsFile %s/known_hosts\n  HostKeyAlias github.com\n  StrictHostKeyChecking yes\n' "$repo" "$dir" "$repo" "$dir" >> "$dir/config"
           done
           echo "GIT_SSH_COMMAND=ssh -F $dir/config" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
