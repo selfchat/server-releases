@@ -1,0 +1,229 @@
+name: Community release
+
+# The public download of selfchat-community (selfchat/community is private).
+#
+# Beside the server's own releases (release.yml, server-v* tags):
+# selfchat/community's release workflow pushes a community-vX.Y.Z tag here
+# for each of its vX.Y.Z tags. That push starts this workflow, which builds
+# that version from source and publishes:
+#
+# - a community-vX.Y.Z release with static Linux binaries (x86-64 and
+#   ARM64) and docker-compose.yml, with the Docker guide (docs/docker.md)
+#   as its notes;
+# - the multi-arch Docker image ghcr.io/selfchat/community:vX.Y.Z, and
+#   :latest for the newest version. The app's Create a community › Your
+#   own server commands use :latest.
+#
+# A community release is never this repository's "latest release": the
+# app's mailbox installer link is releases/latest/download/install.sh, so
+# that must stay the newest server release.
+#
+# This repository is public, so its runners are free, and the image,
+# linked here by its source label, is public too.
+#
+# By hand: run this workflow with a tag (e.g. community-v0.1.0) to publish
+# that version again. To check the build without publishing anything, also
+# give source_ref (a branch or commit of selfchat/community).
+
+on:
+  push:
+    tags: ["community-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish, e.g. community-v0.1.0"
+        required: true
+      source_ref:
+        description: "Only build this branch or commit of selfchat/community, publishing nothing (a test)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Which version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      ref: ${{ steps.v.outputs.ref }}
+      publish: ${{ steps.v.outputs.publish }}
+    steps:
+      - id: v
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^community-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Expected a tag like community-v0.1.0, got $TAG"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [ -n "$SOURCE_REF" ]; then
+            echo "ref=$SOURCE_REF" >> "$GITHUB_OUTPUT"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Test build of $SOURCE_REF: nothing is published."
+          else
+            # community-v0.1.0 here is v0.1.0 in selfchat/community.
+            echo "ref=refs/tags/${TAG#community-}" >> "$GITHUB_OUTPUT"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Static Linux binaries: musl, so they run on any distro, a Raspberry Pi
+  # or a NAS, whatever its C library.
+  binaries:
+    name: Linux ${{ matrix.arch }} binary
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    env:
+      # selfchat-proto comes from the private selfchat/proto over SSH: cargo
+      # uses git, with https rewritten to SSH for this job only.
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: url.git@github.com:selfchat/proto.insteadOf
+      GIT_CONFIG_VALUE_0: https://github.com/selfchat/proto
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: selfchat/community
+          ref: ${{ needs.version.outputs.ref }}
+          ssh-key: ${{ secrets.COMMUNITY_DEPLOY_KEY }}
+          path: community
+      # Read access to selfchat/proto: the deploy key and GitHub's host key
+      # go in this job's temp folder, used through GIT_SSH_COMMAND.
+      - name: Read access to selfchat/proto
+        shell: bash
+        env:
+          KEY: ${{ secrets.PROTO_DEPLOY_KEY }}
+        run: |
+          umask 077
+          dir="$RUNNER_TEMP/proto-ssh"
+          mkdir -p "$dir"
+          printf '%s\n' "$KEY" > "$dir/key"
+          # GitHub's published SSH host key.
+          echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$dir/known_hosts"
+          echo "GIT_SSH_COMMAND=ssh -i $dir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$dir/known_hosts -o StrictHostKeyChecking=yes" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.arch }}-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release -p selfchat-community --locked --target ${{ matrix.arch }}-unknown-linux-musl
+        working-directory: community
+      - name: Name and checksum it
+        run: |
+          mkdir out
+          cp community/target/${{ matrix.arch }}-unknown-linux-musl/release/selfchat-community out/selfchat-community-${{ matrix.arch }}-linux
+          cd out && sha256sum selfchat-community-${{ matrix.arch }}-linux > selfchat-community-${{ matrix.arch }}-linux.sha256
+      - name: Check it runs
+        if: matrix.arch == 'x86_64'
+        run: out/selfchat-community-x86_64-linux --version
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: selfchat-community-${{ matrix.arch }}-linux
+          path: out/*
+
+  publish:
+    name: Publish
+    needs: [version, binaries]
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: selfchat/community
+          ref: ${{ needs.version.outputs.ref }}
+          ssh-key: ${{ secrets.COMMUNITY_DEPLOY_KEY }}
+          path: community
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: out
+          merge-multiple: true
+      - name: Gather the deploy files
+        run: |
+          cp community/deploy/docker-compose.yml community/deploy/docker-compose.postgres.yml out/
+          ls -l out
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/* -R "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" out/* -R "$GITHUB_REPOSITORY" --latest=false \
+              --title "selfchat-community ${TAG#community-v}" \
+              --notes-file community/docs/docker.md
+          fi
+
+  # Multi-arch image from the same binaries. A test build makes it without
+  # pushing.
+  docker:
+    name: Docker image
+    # After the release, so its tag exists here for the :latest check.
+    needs: [version, binaries, publish]
+    if: always() && needs.binaries.result == 'success' && (needs.publish.result == 'success' || needs.version.outputs.publish != 'true')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: selfchat/community
+          ref: ${{ needs.version.outputs.ref }}
+          ssh-key: ${{ secrets.COMMUNITY_DEPLOY_KEY }}
+          path: community
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: community/deploy/bin
+          merge-multiple: true
+      - name: Image tags
+        id: tags
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          version="v${TAG#community-v}"
+          tags="ghcr.io/selfchat/community:$version"
+          # :latest only for the newest community-v* tag, so publishing an
+          # older version again doesn't move it back.
+          newest=$(git ls-remote --tags --refs "https://github.com/$GITHUB_REPOSITORY" 'community-v*' \
+            | sed 's|.*refs/tags/||' | sort -V | tail -n 1)
+          if [ "$newest" = "$TAG" ]; then
+            tags="$tags,ghcr.io/selfchat/community:latest"
+          fi
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "Image tags: $tags"
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        if: needs.version.outputs.publish == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: community/deploy
+          file: community/deploy/Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: ${{ needs.version.outputs.publish == 'true' }}
+          tags: ${{ steps.tags.outputs.tags }}
+          # Links the package to this public repository.
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=selfchat community server
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
