@@ -64,6 +64,13 @@ jobs:
             runner: ubuntu-latest
           - arch: aarch64
             runner: ubuntu-24.04-arm
+    env:
+      # selfchat-proto comes from the private selfchat/proto over SSH: cargo
+      # uses git, with https rewritten to SSH for this job only.
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: url.git@github.com:selfchat/proto.insteadOf
+      GIT_CONFIG_VALUE_0: https://github.com/selfchat/proto
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -71,6 +78,24 @@ jobs:
           ref: ${{ needs.version.outputs.ref }}
           ssh-key: ${{ secrets.SERVER_DEPLOY_KEY }}
           path: server
+      # Read access to selfchat/proto: the deploy key and GitHub's host key
+      # go in this job's temp folder, used through GIT_SSH_COMMAND. Nothing
+      # goes in ~/.ssh or the global git config, which would stay on a
+      # self-hosted machine for the next job (and another repository's).
+      - name: Read access to selfchat/proto
+        shell: bash
+        env:
+          KEY: ${{ secrets.PROTO_DEPLOY_KEY }}
+        run: |
+          umask 077
+          tmp="$RUNNER_TEMP"
+          command -v cygpath >/dev/null && tmp="$(cygpath -m "$RUNNER_TEMP")"
+          dir="$tmp/proto-ssh"
+          mkdir -p "$dir"
+          printf '%s\n' "$KEY" > "$dir/key"
+          # GitHub's published SSH host key.
+          echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$dir/known_hosts"
+          echo "GIT_SSH_COMMAND=ssh -i $dir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$dir/known_hosts -o StrictHostKeyChecking=yes" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: stable
