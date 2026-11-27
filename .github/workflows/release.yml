@@ -131,8 +131,15 @@ jobs:
           path: out
           merge-multiple: true
       - name: Gather the installer and deploy files
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
+          set -euo pipefail
           cp server/deploy/install.sh server/deploy/selfchat.service server/deploy/docker-compose.yml out/
+          # The published compose file names this exact version, not
+          # :latest, so an install keeps what was checked until you update.
+          sed -i "s|ghcr.io/selfchat/server:latest|ghcr.io/selfchat/server:v${TAG#server-v}|" out/docker-compose.yml
+          grep -q "ghcr.io/selfchat/server:v${TAG#server-v}" out/docker-compose.yml
           (cd out && sha256sum install.sh > install.sh.sha256)
           ls -l out
       # Every file gets an Ed25519 signature (name.sig). install.sh has the
